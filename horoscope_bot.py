@@ -14,8 +14,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M
-from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+from telegram import (Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M,
+                      InlineQueryResultArticle, InputTextMessageContent)
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler,
                           MessageHandler, ContextTypes, filters)
 
 BASE = Path(__file__).parent
@@ -257,14 +258,20 @@ async def fetch_external(sign: str, period: str):
         return None
 
 
-async def get_horoscope(sign: str, period: str) -> str:
+def local_horoscope(sign: str, period: str) -> str:
     e, name = SIGNS[sign][0], SIGNS[sign][1]
     head = f"{e} *{name}* · {period_title(period)}\n🌙 {moon_line()}\n\n"
-    ext = await fetch_external(sign, period)
-    if ext:
-        return f"{head}{ext}\n\n_Источник: {EXT_NAME}_"
     r = random.Random(f"{sign}-{period}-{period_key(period)}")  # одинаково в течение периода
     return head + {"day": h_day, "week": h_week, "month": h_month}[period](r)
+
+
+async def get_horoscope(sign: str, period: str) -> str:
+    e, name = SIGNS[sign][0], SIGNS[sign][1]
+    ext = await fetch_external(sign, period)
+    if ext:
+        head = f"{e} *{name}* · {period_title(period)}\n🌙 {moon_line()}\n\n"
+        return f"{head}{ext}\n\n_Источник: {EXT_NAME}_"
+    return local_horoscope(sign, period)
 
 
 def compatibility(a: str, b: str) -> str:
@@ -318,6 +325,7 @@ def after_kb(sign: str, cur: str) -> M:
     others = [B(PERIODS[p], callback_data=f"p:{sign}:{p}") for p in PERIODS if p != cur]
     return M([others,
               [B("💞 Совместимость", callback_data=f"k:{sign}"), B("🃏 Карта дня", callback_data=f"tarot:{sign}")],
+              [B("📤 Отправить в чат", switch_inline_query=SIGNS[sign][1])],
               [B("⬅️ В меню", callback_data=f"s2:{sign}")]])
 
 
@@ -433,9 +441,54 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sign = sign_by_date(d, mo)
         db_set(uid, sign=sign, chat=update.effective_chat.id)
         await show_sign(ctx.bot, update.effective_chat.id, uid, sign)
+    elif update.effective_chat.type != "private":
+        return  # в группах без запроса молчим
     else:
         await update.message.reply_text("Нажмите /start, чтобы открыть меню 👇",
                                         reply_markup=M([[B("✨ Открыть меню", callback_data="home")]]))
+
+
+def build_inline(query: str, uid) -> list:
+    """Результаты для вызова бота через @имя_бота в любом чате: (id, заголовок, описание, текст)."""
+    words = [w for w in query.lower().split() if len(w) >= 2]
+    found = []
+    for w in words:
+        for k, v in SIGNS.items():
+            if v[1].lower().startswith(w) and k not in found:
+                found.append(k)
+    out = []
+
+    def add(rid, title, text):
+        desc = re.sub(r"[*_`]", "", text.split("\n\n")[1] if "\n\n" in text else text)[:90].replace("\n", " ")
+        out.append((rid, title, desc, text))
+
+    if len(found) >= 2:
+        a, b = found[0], found[1]
+        add(f"k-{a}-{b}", f"💞 {SIGNS[a][1]} + {SIGNS[b][1]}: совместимость", compatibility(a, b))
+    if found:
+        for sign in found[:2]:
+            e, name = SIGNS[sign][0], SIGNS[sign][1]
+            for p, label in (("day", "на сегодня"), ("week", "на неделю"), ("month", "на месяц")):
+                add(f"h-{sign}-{p}", f"{e} {name} · {label}", local_horoscope(sign, p))
+            add(f"c-{sign}", f"🧬 {name}: характер", f"{e} *{name}* · характер\n\n{SIGNS[sign][4]}")
+    else:
+        me = db_get(uid, "sign")
+        order = ([me] if me else []) + [k for k in SIGNS if k != me]
+        for sign in order:
+            e, name = SIGNS[sign][0], SIGNS[sign][1]
+            add(f"h-{sign}-day", f"{e} {name} · гороскоп на сегодня", local_horoscope(sign, "day"))
+        add("tarot", "🃏 Карта дня", tarot_text(uid))
+        add("ball", "🎱 Шар предсказаний", f"🎱 {random.choice(BALL)}")
+    return out[:50]
+
+
+async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.inline_query
+    items = build_inline(q.query, q.from_user.id)
+    results = [InlineQueryResultArticle(id=rid[:64], title=title, description=desc,
+                                        input_message_content=InputTextMessageContent(text, parse_mode="Markdown"))
+               for rid, title, desc, text in items]
+    await q.answer(results, cache_time=1, is_personal=True)
 
 
 async def daily_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -452,6 +505,7 @@ def main():
     app = Application.builder().token(os.environ["BOT_TOKEN"]).build()
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(InlineQueryHandler(on_inline))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
         try:
